@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# 日志文件
+*.log
+*.txt
+
+# 旧数据备份
+backup/
+
+# Editor
+.vscode/
