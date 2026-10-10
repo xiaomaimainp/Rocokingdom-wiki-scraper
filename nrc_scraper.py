@@ -25,9 +25,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
 # Windows 下输出默认 GBK 会导致中文乱码，统一为 UTF-8
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
-    sys.stderr.reconfigure(encoding='utf-8')
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, 'reconfigure'):
+        getattr(_s, 'reconfigure')(encoding='utf-8')
 
 from scrapling.fetchers import Fetcher, StealthyFetcher
 
@@ -62,12 +62,14 @@ SKILL_FIELDS = ['技能名称', '技能属性', '技能类型', '威力', '耗�
                 '技能描述', '风味文本']
 SOURCE_FIELDS = ['精灵名称', '技能名称', '来源类型', '等级', '获取条件']
 COMBINED_FIELDS = ['序号', '精灵名称', '属性', '技能名称1', '技能名称2', '技能名称3', '条件']
+EVO_FIELDS = ['家族', '分支', '阶序', '源精灵', '源精灵序号', '目标精灵', '目标精灵序号', '进化条件', '是否特殊']
 
 F_SPIRITS = 'spirits_data_all.csv'
 F_SPIRITS_XLSX = 'spirits_data_all.xlsx'
 F_SKILLS = 'skills_data.csv'
 F_SOURCES = 'skill_sources.csv'
 F_COMBINED = 'combined_data.csv'
+F_EVO = 'evo_chains.csv'
 
 
 # ====================== 日志 ======================
@@ -417,17 +419,67 @@ def parse_pet_skills(page, pet_name):
     return rows
 
 
+def parse_evo_chain(page, pet_name):
+    """解析精灵页「进化链」面板，返回该页家族的所有进化步骤。
+
+    .roco-evo-wrap > .roco-evo-timeline（data-branch 标分支）> 节点与连接交替：
+        .roco-evo-node           一个形态（.roco-evo-name-main a[title] 为名，
+                                 .roco-evo-name-sub 为「初阶 · 冰」阶位）
+        .roco-evo-conn > .roco-evo-conn-pill > span   进化条件文本
+    一个家族的完整链在任意成员页都能拿到，按家族去重由 build_evo_chains 处理。
+    """
+    steps = []
+    for tl in page.css('.roco-evo-timeline'):
+        branch = (tl.attrib.get('data-branch') or '').strip() or '1'
+        nodes = tl.css('.roco-evo-node')
+        conns = tl.css('.roco-evo-conn')
+        for i in range(len(nodes) - 1):
+            src = _evo_name(nodes[i])
+            tgt = _evo_name(nodes[i + 1])
+            if not src or not tgt:
+                continue
+            cond = ''.join(t.strip() for t in conns[i].css('.roco-evo-conn-pill *::text').getall())
+            steps.append({'分支': branch, '阶序': _evo_sub(nodes[i]),
+                          '源精灵': src, '目标精灵': tgt, '进化条件': cond})
+    return steps
+
+
+def _evo_name(node):
+    a = node.css('.roco-evo-name-main a')
+    if a:
+        return (a[0].attrib.get('title') or '').strip() or ''.join(
+            t.strip() for t in a[0].css('::text').getall())
+    return ''.join(t.strip() for t in node.css('.roco-evo-name-main::text').getall())
+
+
+def _evo_sub(node):
+    return ''.join(t.strip() for t in node.css('.roco-evo-name-sub::text').getall())
+
+
+def parse_pet_full(page, pet_name):
+    """精灵详情页：同时解析技能来源与进化链（复用同一次抓取）"""
+    return {'skills': parse_pet_skills(page, pet_name),
+            'evo': parse_evo_chain(page, pet_name)}
+
+
 def crawl_sources(names):
-    """精灵 × 技能 来源表：自学(Lv.x) / 技能石 / 血脉 / 传说，并带获取条件"""
-    print(f"\n===== 抓取精灵详情页技能表 =====")
+    """精灵 × 技能 来源表 + 进化链（自学/技能石/血脉/传说，含获取条件）。
+
+    复用精灵详情页的同一次抓取，同时取出技能来源与进化链，避免二次请求。
+    返回 (skills_rows, evo_by_spirit)。
+    """
+    print(f"\n===== 抓取精灵详情页（技能表 + 进化链）=====")
     targets = [(n, BASE + quote(n)) for n in names]
     got = Spider('精灵技能表').run(
-        targets, lambda p: bool(p.css('.roco-sk-card')), parse_pet_skills)
-    rows = []
+        targets, lambda p: bool(p.css('.roco-sk-card')), parse_pet_full)
+    skills, evo_by = [], {}
     for n in names:
-        rows.extend(got.get(n, []))
-    print(f"技能来源共 {len(rows)} 条（{len(got)}/{len(names)} 个精灵）")
-    return rows
+        d = got.get(n)
+        if d:
+            skills.extend(d['skills'])
+            evo_by[n] = d['evo']
+    print(f"技能来源共 {len(skills)} 条（{len(got)}/{len(names)} 个精灵）；进化链待合并")
+    return skills, evo_by
 
 
 # ====================== 读写 ======================
@@ -593,6 +645,88 @@ def build_combined(spirits, sources, max_skills=MAX_SKILLS):
     return combined
 
 
+# 普通进化（非特殊）= 纯等级进化：仅 LVx，或 LVx 进化（不带突破/天气/性别等附加条件）
+STD_EVO = re.compile(r'^LV\d+\s*(进化)?\s*$', re.IGNORECASE)
+
+
+def _is_special_family(steps):
+    """家族是否特殊：存在分支（data-branch>1）或任一进化步骤不是纯等级进化。"""
+    branches = {s['分支'] for s in steps}
+    any_special = any(not STD_EVO.match(s['进化条件']) for s in steps)
+    return len(branches) > 1 or any_special
+
+
+def build_evo_chains(evo_by):
+    """按家族去重，生成进化链步骤表，并标记特殊链。
+
+    特殊 = 存在分支（data-branch>1）或任一进化步骤的条件不是纯等级进化
+    （突破、天气/时间、性别、技能使用、道具、特定条件等都算特殊）。
+    只有「LVx」或「LVx 进化」这类纯等级进化才算普通。
+    """
+    families = {}
+    for spirit, steps in evo_by.items():
+        if not steps:
+            continue
+        srcs = {s['源精灵'] for s in steps}
+        tgts = {s['目标精灵'] for s in steps}
+        roots = srcs - tgts
+        root = (sorted(roots)[0] if roots else (sorted(srcs)[0] if srcs else spirit))
+        if root in families:        # 同一家族只在首次出现的精灵页取一次
+            continue
+        special = '是' if _is_special_family(steps) else '否'
+        families[root] = (steps, special)
+
+    rows = []
+    for root in sorted(families):
+        steps, special = families[root]
+        for s in steps:
+            rows.append({'家族': root, '分支': s['分支'], '阶序': s['阶序'],
+                         '源精灵': s['源精灵'], '目标精灵': s['目标精灵'],
+                         '进化条件': s['进化条件'], '是否特殊': special})
+    return rows
+
+
+def flag_evo_special(rows):
+    """按家族重算「是否特殊」标记（不重新联网，供 rebuild 复用）。"""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in rows:
+        groups[r['家族']].append(r)
+    for items in groups.values():
+        special = '是' if _is_special_family(items) else '否'
+        for r in items:
+            r['是否特殊'] = special
+    return rows
+
+
+def build_spirit_no_map(spirits):
+    """基础名 -> 序号（忽略「（…）」形态后缀），供进化链按序号比对。"""
+    m = {}
+    for r in spirits:
+        base = base_name(r.get('精灵名称', ''))
+        if base and base not in m:
+            m[base] = r.get('序号', '')
+    return m
+
+
+def enrich_evo_no(evo_rows, spirits):
+    """为进化链每行补上源/目标精灵的 序号（按图鉴主 key 比对，规避形态后缀差异）。"""
+    m = build_spirit_no_map(spirits)
+    for r in evo_rows:
+        r['源精灵序号'] = m.get(base_name(r.get('源精灵', '')), '')
+        r['目标精灵序号'] = m.get(base_name(r.get('目标精灵', '')), '')
+    return evo_rows
+
+
+def sort_evo(rows):
+    """按源精灵序号升序（0→x）排列，家族内步骤自然保持顺序。"""
+    def key(r):
+        no = r.get('源精灵序号', '')
+        return (int(no) if str(no).isdigit() else 10 ** 9,
+                r.get('家族', ''), str(r.get('分支', '')))
+    return sorted(rows, key=key)
+
+
 # ====================== 体检 ======================
 def mark_quest(spirits, sources):
     """给精灵档案补「技能石课题」列（有/无），替代单独的清单文件"""
@@ -603,7 +737,7 @@ def mark_quest(spirits, sources):
     return spirits
 
 
-def check_data(spirits, skills, sources, combined, label=''):
+def check_data(spirits, skills, sources, combined, evo, label=''):
     """检查数据完整性，返回 (统计 dict, 问题 list)"""
     stats, issues = {}, []
 
@@ -658,6 +792,19 @@ def check_data(spirits, skills, sources, combined, label=''):
     if combined and len(combined) < want:
         issues.append(f'合并表：有课题的序号 {want} 个，只进了 {len(combined)} 行')
 
+    # ---- 进化链 ----
+    stats['进化家族'] = len(evo)
+    if evo:
+        stats['特殊家族'] = sum(1 for r in evo if r.get('是否特殊') == '是')
+        no_map = build_spirit_no_map(spirits)      # 基础名 -> 序号（按序列比对）
+        missing = sorted({(r['源精灵'], r['源精灵序号']) for r in evo
+                          if base_name(r['源精灵']) not in no_map}
+                         | {(r['目标精灵'], r['目标精灵序号']) for r in evo
+                            if base_name(r['目标精灵']) not in no_map})
+        if missing:
+            issues.append(f'进化链：{len(missing)} 个名称在精灵表（按序号）找不到，'
+                          f'如 {[m[0] for m in missing[:8]]}')
+
     # ---- 输出 ----
     print(f"\n===== 体检{'：' + label if label else ''} =====")
     for k, v in stats.items():
@@ -695,13 +842,14 @@ def diff_report(old_spirits, new_spirits, old_skills, new_skills):
 
 
 # ====================== 主流程 ======================
-def write_all(spirits, skills, sources, combined, label):
+def write_all(spirits, skills, sources, combined, evo, label):
     save_csv(spirits, F_SPIRITS, SPIRIT_FIELDS)
     save_xlsx(spirits, F_SPIRITS_XLSX, SPIRIT_FIELDS)
     save_csv(skills, F_SKILLS, SKILL_FIELDS)
     save_csv(sources, F_SOURCES, SOURCE_FIELDS)
     save_csv(combined, F_COMBINED, COMBINED_FIELDS)
-    check_data(spirits, skills, sources, combined, label)
+    save_csv(evo, F_EVO, EVO_FIELDS)
+    check_data(spirits, skills, sources, combined, evo, label)
 
 
 def run_update():
@@ -713,11 +861,12 @@ def run_update():
     old_skills = read_csv(F_SKILLS, SKILL_FIELDS)
     old_sources = read_csv(F_SOURCES, SOURCE_FIELDS)
     old_combined = read_csv(F_COMBINED, COMBINED_FIELDS)
+    old_evo = read_csv(F_EVO, EVO_FIELDS)
 
     if old_spirits and old_skills:
         print(f"已有数据：精灵 {len(old_spirits)} / 技能 {len(old_skills)} / "
               f"来源 {len(old_sources)} / 合并表 {len(old_combined)}")
-        check_data(old_spirits, old_skills, old_sources, old_combined, '上次数据')
+        check_data(old_spirits, old_skills, old_sources, old_combined, old_evo, '上次数据')
     else:
         print("未发现已有数据，本次将全量建立")
 
@@ -726,7 +875,7 @@ def run_update():
     if not new_spirits or not new_skills:
         print("本次抓取为空，未改动数据文件")
         return
-    new_sources = crawl_sources([r['精灵名称'] for r in new_spirits])
+    new_sources, new_evo_by = crawl_sources([r['精灵名称'] for r in new_spirits])
 
     if old_spirits:
         diff_report(old_spirits, new_spirits, old_skills, new_skills)
@@ -738,7 +887,8 @@ def run_update():
           f"技能 +{len(add_k)} → {len(skills)}；来源 +{len(add_r)} → {len(sources)}")
 
     mark_quest(spirits, sources)
-    write_all(spirits, skills, sources, build_combined(spirits, sources), '合并后复检')
+    evo = sort_evo(enrich_evo_no(build_evo_chains(new_evo_by), spirits))
+    write_all(spirits, skills, sources, build_combined(spirits, sources), evo, '合并后复检')
     print("\n更新完成")
 
 
@@ -747,22 +897,24 @@ def run_check():
     skills = read_csv(F_SKILLS, SKILL_FIELDS)
     sources = read_csv(F_SOURCES, SOURCE_FIELDS)
     combined = read_csv(F_COMBINED, COMBINED_FIELDS)
+    evo = read_csv(F_EVO, EVO_FIELDS)
     if not spirits and not skills:
         print("没有可体检的数据文件")
         return
-    check_data(spirits, skills, sources, combined, '当前数据')
+    check_data(spirits, skills, sources, combined, evo, '当前数据')
 
 
 def run_rebuild():
-    """不联网，用已有 CSV 重算合并表与「技能石课题」列"""
+    """不联网，用已有 CSV 重算合并表与「技能石课题」列，并据当前规则重算进化链特殊标记"""
     spirits = read_csv(F_SPIRITS, SPIRIT_FIELDS)
     skills = read_csv(F_SKILLS, SKILL_FIELDS)
     sources = read_csv(F_SOURCES, SOURCE_FIELDS)
+    evo = sort_evo(enrich_evo_no(flag_evo_special(read_csv(F_EVO, EVO_FIELDS)), spirits))
     if not spirits or not sources:
         print("缺少数据文件，请先运行 nrc_scraper.py")
         return
     mark_quest(spirits, sources)
-    write_all(spirits, skills, sources, build_combined(spirits, sources), '重建后复检')
+    write_all(spirits, skills, sources, build_combined(spirits, sources), evo, '重建后复检')
 
 
 def main():
