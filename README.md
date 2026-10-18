@@ -34,6 +34,12 @@ python nrc_scraper.py check
 
 # 不联网，用已有 CSV 重算合并表与「技能石课题」列
 python nrc_scraper.py rebuild
+
+# 抓取「图鉴课题」聚合页，生成技能石清单 skill_stones.csv（一次静态请求覆盖全部有课题的物种）
+python nrc_scraper.py skillstones
+
+# 用聚合页交叉验证主爬取的技能石课题（按序号比对差异）
+python nrc_scraper.py validate
 ```
 
 - 第一次没有数据也能直接跑，会全量建立；
@@ -49,6 +55,8 @@ python nrc_scraper.py rebuild
 | `skill_sources.csv` | 30772 | 精灵 × 技能 来源（谁会这招、怎么学：自学 / 技能石 / 血脉 / 传说，含获取条件） | 全部 |
 | `combined_data.csv` | 203 | 合并表：精灵 → 最多 3 个技能石 + 获取条件 | 全部 / `rebuild` |
 | `evo_chains.csv` | 进化链：家族 / 分支 / 阶序 / 源精灵(+序号) → 目标精灵(+序号) + 进化条件 + 是否特殊 | 全部 |
+| `skill_stones.csv` | 技能石清单：序号 / 精灵名称 / 类别 / 条件 / 奖励ID（按物种去重，每物种一行） | `skillstones` |
+| `skill_stones_diff.csv` | 交叉验证差异明细（仅 `validate` 有差异时生成） | `validate` |
 
 ## 合并表格式（combined_data.csv）
 
@@ -127,8 +135,14 @@ python nrc_scraper.py rebuild
 - 最终 `evo_chains.csv` 按 `源精灵序号` 升序（0→x）输出，家族内步骤与分支保持原有顺序。
 
 ### 合并表（`build_combined`）
-- 汇总每只精灵的图鉴课题（技能 + `使用N次` 条件），按基础名归组；
-- 代表形态优先取「有阶数」的本体，再按「序号 + 条件」合并同一进化链。
+- **课题（技能石）以官方「图鉴课题」聚合页（`skill_stones.csv`）为准**：按**序号（物种）一行**，技能石归属与官方页完全一致——分支形态（如 191 的「棋契陛下 / 棋祈督」）不再被拆成重复行，技能也不会被错归到其他序号；`属性` 取自精灵表的该序号主属性，`精灵名称` 取官方页的物种名。
+- 因此 `combined_data.csv` 的技能石**数量与官方聚合页逐条一致**（无重复、无遗漏）；无聚合页数据时回退到「按基础名归组来源表」的旧逻辑。
+
+### 技能石清单与交叉验证（`skillstones` / `validate`）
+- `python nrc_scraper.py skillstones` 抓取 wiki 的「图鉴课题」聚合页，解析全部技能石课题，写出 `skill_stones.csv`（也是 `update` / `rebuild` 构建合并表的数据源）：
+  - 数据内嵌在聚合页静态 HTML 的 `book="..."` 属性（HTML 实体转义 JSON），**一次静态请求即可覆盖全部有课题的物种**，无需渲染、无需翻页；
+  - 每个物种一行（按序号 + 名称），每一条技能石课题一行；列为 `序号, 精灵名称, 类别, 条件, 奖励ID`；`类别` 固定为 `技能石`，`条件` 即「使用N次XX」，`奖励ID` 为物品 ID（含技能石本体 + 课题研究点）。
+- `python nrc_scraper.py validate` 用 `skill_stones.csv` **交叉验证**主爬取（逐精灵页）的技能石课题：按序号对比两者条件集合，列出「仅主爬取有 / 仅聚合页有」的差异，并写出 `skill_stones_diff.csv`（验证归属映射已修正，目前 202 物种全部一致、0 差异）。
 
 ## 配置项（文件顶部）
 

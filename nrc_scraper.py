@@ -12,6 +12,8 @@
     python nrc_scraper.py            # 抓取 → 体检 → 合并 → 复检
     python nrc_scraper.py check      # 只体检已有数据文件，不联网
     python nrc_scraper.py rebuild    # 不联网，用已有 CSV 重算合并表
+    python nrc_scraper.py skillstones# 抓取图鉴课题聚合页，生成 skill_stones.csv（技能石）
+    python nrc_scraper.py validate   # 用聚合页交叉验证主爬取的技能石课题
 """
 import csv
 import logging
@@ -23,6 +25,8 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
+import html as _html
+import json
 
 # Windows 下输出默认 GBK 会导致中文乱码，统一为 UTF-8
 for _s in (sys.stdout, sys.stderr):
@@ -70,6 +74,8 @@ F_SKILLS = 'skills_data.csv'
 F_SOURCES = 'skill_sources.csv'
 F_COMBINED = 'combined_data.csv'
 F_EVO = 'evo_chains.csv'
+F_STONES = 'skill_stones.csv'
+STONE_FIELDS = ['序号', '精灵名称', '类别', '条件', '奖励ID']
 
 
 # ====================== 日志 ======================
@@ -593,42 +599,72 @@ def quest_index(sources):
     return idx
 
 
-def build_combined(spirits, sources, max_skills=MAX_SKILLS):
-    """精灵 -> 最多 N 个技能石 + 获取条件（视图）
+def _build_combined_from_stones(spirits, stones, max_skills=MAX_SKILLS):
+    """从「图鉴课题」聚合页（skill_stones）构建合并表：按序号（物种）一行，
+    技能石归属与官方页完全一致——分支形态不再各自成行，无重复。"""
+    attr_by_no = {}
+    for s in spirits:
+        no = s.get('序号', '')
+        if no and no not in attr_by_no:
+            attr_by_no[no] = s.get('主属性', '')
+    by_no, name_by_no = defaultdict(list), {}
+    for r in stones:
+        no = r.get('序号', '')
+        if not str(no).isdigit():
+            continue
+        by_no[no].append(r)
+        name_by_no.setdefault(no, r.get('精灵名称', ''))
+    rows = []
+    for no, lst in by_no.items():
+        picked = []
+        for r in lst:
+            cond = (r.get('条件') or '').strip()
+            m = re.match(r'^使用\d+次(.+)$', cond)
+            skill = m.group(1).strip() if m else ''
+            picked.append((skill, cond))
+        picked = picked[:max_skills]
+        rows.append({
+            '序号': no,
+            '精灵名称': name_by_no.get(no, ''),
+            '属性': attr_by_no.get(no, ''),
+            **{f'技能名称{i + 1}': picked[i][0] if i < len(picked) else ''
+               for i in range(max_skills)},
+            '条件': '; '.join(c for _, c in picked),
+        })
+    rows.sort(key=lambda x: (int(x['序号']) if str(x['序号']).isdigit() else 99999, x['精灵名称']))
+    return rows
 
-    数据来自来源表里的「图鉴课题」：每只精灵的课题奖励若干技能石，
-    条件形如「使用2次水炮」。没有课题的精灵不出现在表里。
 
-    同一精灵的各形态（「鸭吉吉（燃了鸭）」等）条件完全相同，
-    合并成一行，名称取括号前的基础名。
+def build_combined(spirits, sources, stones=None, max_skills=MAX_SKILLS):
+    """合并表：精灵 → 最多 N 个技能石 + 获取条件（视图）。
 
-    同一序号的进化链成员（迪莫 / 圣光迪莫 / 圣水迪莫…）课题也一样，
-    再合并成一行，保留本体形态（有「精灵阶数」的那个）。
-    条件不同的仍各自成行。
+    优先以官方「图鉴课题」聚合页（skill_stones）为准：按序号（物种）一行，
+    技能石归属与官方页完全一致，避免分支形态（如 191 棋契陛下 / 棋祈督）
+    被拆成重复行、或技能被错归到其他序号。
+    无聚合页数据时回退到逐精灵来源表（按基础名归组）。
     """
+    if stones is None and os.path.exists(F_STONES):
+        stones = read_csv(F_STONES, STONE_FIELDS)
+    if stones:
+        return _build_combined_from_stones(spirits, stones, max_skills)
+    # 回退路径：基于来源表按基础名归组（与旧逻辑一致）
     by_base = defaultdict(list)
     for s in spirits:
         by_base[base_name(s.get('精灵名称', ''))].append(s)
-
     idx = quest_index(sources)
-
     rows = []
     for base, spirit_list in by_base.items():
         picked = idx.get(base, [])[:max_skills]
         if not picked:
             continue
-        # 代表形态：优先有阶数的（本体），再取名字最短的
         info = min(spirit_list, key=lambda r: (0 if r.get('精灵阶数') else 1,
                                                len(r.get('精灵名称', '')),
                                                r.get('精灵名称', '')))
         rows.append((info.get('序号', ''), info.get('主属性', ''),
                      info.get('精灵阶数', ''), base, tuple(picked)))
-
-    # 同一序号 + 相同条件 = 同一条进化链，只留一行
     groups = defaultdict(list)
     for no, attr, stage, base, picked in rows:
         groups[(no, picked)].append((0 if stage else 1, len(base), base, attr))
-
     combined = []
     for (no, picked), cands in groups.items():
         _, _, name, attr = min(cands)
@@ -640,8 +676,7 @@ def build_combined(spirits, sources, max_skills=MAX_SKILLS):
                for i in range(max_skills)},
             '条件': '; '.join(c for _, c in picked),
         })
-    combined.sort(key=lambda x: (
-        int(x['序号']) if str(x['序号']).isdigit() else 99999, x['精灵名称']))
+    combined.sort(key=lambda x: (int(x['序号']) if str(x['序号']).isdigit() else 99999, x['精灵名称']))
     return combined
 
 
@@ -728,8 +763,15 @@ def sort_evo(rows):
 
 
 # ====================== 体检 ======================
-def mark_quest(spirits, sources):
-    """给精灵档案补「技能石课题」列（有/无），替代单独的清单文件"""
+def mark_quest(spirits, sources, stones=None):
+    """给精灵档案补「技能石课题」列（有/无）。有聚合页数据时按序号（物种）判定，否则回退基础名。"""
+    if stones is None and os.path.exists(F_STONES):
+        stones = read_csv(F_STONES, STONE_FIELDS)
+    if stones:
+        has_no = {r.get('序号') for r in stones if str(r.get('序号', '')).isdigit()}
+        for r in spirits:
+            r['技能石课题'] = '有' if r.get('序号') in has_no else '无'
+        return spirits
     has = {base_name(r['精灵名称']) for r in sources
            if re.search(r'使用\d+次', r.get('获取条件') or '')}
     for r in spirits:
@@ -737,7 +779,7 @@ def mark_quest(spirits, sources):
     return spirits
 
 
-def check_data(spirits, skills, sources, combined, evo, label=''):
+def check_data(spirits, skills, sources, combined, evo, stones=None, label=''):
     """检查数据完整性，返回 (统计 dict, 问题 list)"""
     stats, issues = {}, []
 
@@ -792,6 +834,25 @@ def check_data(spirits, skills, sources, combined, evo, label=''):
     if combined and len(combined) < want:
         issues.append(f'合并表：有课题的序号 {want} 个，只进了 {len(combined)} 行')
 
+    # ---- 技能石课题（与图鉴课题聚合页比对）----
+    skill_count = sum(1 for r in combined for i in (1, 2, 3) if r.get(f'技能名称{i}'))
+    stats['技能石课题数'] = skill_count
+    if stones is None and os.path.exists(F_STONES):
+        stones = read_csv(F_STONES, STONE_FIELDS)
+    if stones:
+        agg_total = len(stones)
+        agg_species = len({r['序号'] for r in stones if str(r['序号']).isdigit()})
+        stats['聚合页课题数'] = agg_total
+        stats['聚合页物种数'] = agg_species
+        if skill_count == agg_total and want == agg_species:
+            stats['与聚合页比对'] = '一致'
+        else:
+            stats['与聚合页比对'] = '不一致'
+            issues.append(f'技能石：合并表 {skill_count} 项 / {want} 物种，'
+                          f'与聚合页 {agg_total} 项 / {agg_species} 物种 不一致')
+    else:
+        stats['与聚合页比对'] = '跳过（无聚合页数据）'
+
     # ---- 进化链 ----
     stats['进化家族'] = len(evo)
     if evo:
@@ -842,14 +903,16 @@ def diff_report(old_spirits, new_spirits, old_skills, new_skills):
 
 
 # ====================== 主流程 ======================
-def write_all(spirits, skills, sources, combined, evo, label):
+def write_all(spirits, skills, sources, combined, evo, stones, label):
     save_csv(spirits, F_SPIRITS, SPIRIT_FIELDS)
     save_xlsx(spirits, F_SPIRITS_XLSX, SPIRIT_FIELDS)
     save_csv(skills, F_SKILLS, SKILL_FIELDS)
     save_csv(sources, F_SOURCES, SOURCE_FIELDS)
     save_csv(combined, F_COMBINED, COMBINED_FIELDS)
+    if stones:
+        save_csv(stones, F_STONES, STONE_FIELDS)
     save_csv(evo, F_EVO, EVO_FIELDS)
-    check_data(spirits, skills, sources, combined, evo, label)
+    check_data(spirits, skills, sources, combined, evo, stones, label)
 
 
 def run_update():
@@ -866,7 +929,7 @@ def run_update():
     if old_spirits and old_skills:
         print(f"已有数据：精灵 {len(old_spirits)} / 技能 {len(old_skills)} / "
               f"来源 {len(old_sources)} / 合并表 {len(old_combined)}")
-        check_data(old_spirits, old_skills, old_sources, old_combined, old_evo, '上次数据')
+        check_data(old_spirits, old_skills, old_sources, old_combined, old_evo, label='上次数据')
     else:
         print("未发现已有数据，本次将全量建立")
 
@@ -886,9 +949,15 @@ def run_update():
     print(f"\n合并结果：精灵 +{len(add_s)} → {len(spirits)}；"
           f"技能 +{len(add_k)} → {len(skills)}；来源 +{len(add_r)} → {len(sources)}")
 
-    mark_quest(spirits, sources)
+    # 以官方「图鉴课题」聚合页为准构建合并表（一次性静态抓取，覆盖全量）
+    try:
+        stones = crawl_skill_stones()
+    except Exception as e:
+        print(f"[警告] 聚合页抓取失败，合并表回退到来源表：{e}")
+        stones = None
+    mark_quest(spirits, sources, stones)
     evo = sort_evo(enrich_evo_no(build_evo_chains(new_evo_by), spirits))
-    write_all(spirits, skills, sources, build_combined(spirits, sources), evo, '合并后复检')
+    write_all(spirits, skills, sources, build_combined(spirits, sources, stones), evo, stones, '合并后复检')
     print("\n更新完成")
 
 
@@ -901,7 +970,8 @@ def run_check():
     if not spirits and not skills:
         print("没有可体检的数据文件")
         return
-    check_data(spirits, skills, sources, combined, evo, '当前数据')
+    stones = read_csv(F_STONES, STONE_FIELDS) if os.path.exists(F_STONES) else None
+    check_data(spirits, skills, sources, combined, evo, stones, '当前数据')
 
 
 def run_rebuild():
@@ -913,8 +983,135 @@ def run_rebuild():
     if not spirits or not sources:
         print("缺少数据文件，请先运行 nrc_scraper.py")
         return
-    mark_quest(spirits, sources)
-    write_all(spirits, skills, sources, build_combined(spirits, sources), evo, '重建后复检')
+    stones = read_csv(F_STONES, STONE_FIELDS) if os.path.exists(F_STONES) else None
+    mark_quest(spirits, sources, stones)
+    write_all(spirits, skills, sources, build_combined(spirits, sources, stones), evo, stones, '重建后复检')
+
+
+# ====================== 图鉴课题（技能石）聚合页 ======================
+def extract_skill_stones(html):
+    """从图鉴课题聚合页解析技能石课题。
+
+    数据内嵌在静态 HTML 的 book="..." 属性里（HTML 实体转义 JSON），
+    一次静态请求即可覆盖全部 466 物种，无需分页 / 渲染。
+    每个 handbook：number(序号) / name(物种名) / topics[]，
+    其中 category=='skill' 的 topic 即技能石课题。
+    """
+    books = re.findall(r'book="([^"]+)"', html)
+    rows = []
+    for raw in books:
+        try:
+            o = json.loads(_html.unescape(raw))
+        except Exception:
+            continue
+        no = str(o.get('number', '')).strip()
+        name = (o.get('name') or '').strip()
+        for t in o.get('topics', []):
+            if t.get('category') != 'skill':
+                continue
+            rows.append({
+                '序号': no,
+                '精灵名称': name,
+                '类别': '技能石',
+                '条件': (t.get('text') or '').strip(),
+                '奖励ID': ','.join(str(x) for x in t.get('rewards', [])),
+            })
+    return rows
+
+
+def crawl_skill_stones():
+    """抓取图鉴课题聚合页并解析全部技能石课题（静态请求即可，覆盖全量）"""
+    url = "https://wiki.biligame.com/nrc/%E5%9B%BE%E9%89%B4%E8%AF%BE%E9%A2%98"
+    print("抓取图鉴课题聚合页（技能石）...")
+    page = fetch(url, stealth=False)            # 静态包已含全量数据，无需渲染
+    body = getattr(page, 'body', b'') or b''
+    if isinstance(body, str):
+        body = body.encode('utf-8')
+    html = body.decode('utf-8', 'ignore')
+    rows = extract_skill_stones(html)
+    rows.sort(key=lambda r: (int(r['序号']) if str(r['序号']).isdigit() else 10 ** 9, r['精灵名称']))
+    return rows
+
+
+def run_skillstones():
+    rows = crawl_skill_stones()
+    if not rows:
+        print("未解析到任何技能石课题")
+        return
+    save_csv(rows, F_STONES, STONE_FIELDS)
+    species = len({r['序号'] for r in rows if str(r['序号']).isdigit()})
+    print(f"已写出 {F_STONES}：{len(rows)} 行（{species} 个物种）")
+
+
+def validate_skill_stones():
+    """交叉验证：聚合页技能石课题 vs 逐精灵页主爬取的课题（按序号比对）"""
+    spirits = read_csv(F_SPIRITS, SPIRIT_FIELDS)
+    sources = read_csv(F_SOURCES, SOURCE_FIELDS)
+    stones = read_csv(F_STONES, STONE_FIELDS)
+    if not stones:
+        print("请先运行：python nrc_scraper.py skillstones")
+        return
+    if not spirits or not sources:
+        print("缺少精灵 / 来源数据，无法验证")
+        return
+
+    no_map = build_spirit_no_map(spirits)          # 基础名 -> 序号
+    # 全名精确匹配：分支形态（如「棋契陛下（白棋棋祈督分支）」）必须按全名定位序号，
+    # 否则会被基础名归并到同一序号，造成验证误报。
+    full_map = {r.get('精灵名称'): r.get('序号') for r in spirits if r.get('精灵名称')}
+
+    # 主爬取：来源表里含「使用N次」获取条件的课题，按序号归集
+    main = defaultdict(set)
+    for r in sources:
+        cond = r.get('获取条件') or ''
+        if not re.search(r'使用\d+次', cond):
+            continue
+        nm = r.get('精灵名称', '')
+        no = full_map.get(nm) or no_map.get(base_name(nm))   # 先全名，再基础名兜底
+        if not no:
+            continue
+        for s in cond.split(';'):
+            s = s.strip()
+            if re.search(r'使用\d+次', s):
+                main[no].add(s)
+
+    # 聚合页：按序号归集条件
+    agg = defaultdict(set)
+    for r in stones:
+        no = r.get('序号', '')
+        if str(no).isdigit():
+            agg[no].add(r.get('条件', '').strip())
+
+    diffs = []
+    for no in sorted(set(main) | set(agg), key=lambda x: int(x)):
+        mset, aset = main.get(no, set()), agg.get(no, set())
+        extra_main = mset - aset
+        extra_agg = aset - mset
+        if extra_main or extra_agg:
+            diffs.append((no, extra_main, extra_agg))
+
+    compared = len(set(main) | set(agg))
+    print(f"\n===== 技能石课题交叉验证 =====")
+    print(f"  对比物种数：{compared}")
+    print(f"  一致物种数：{compared - len(diffs)}")
+    print(f"  有差异物种数：{len(diffs)}")
+    diff_rows = []
+    for no, extra_main, extra_agg in diffs[:60]:
+        name = next((r['精灵名称'] for r in stones if r['序号'] == no), '')
+        print(f"  [{no} {name}]")
+        for c in sorted(extra_main):
+            print(f"      仅主爬取有: {c}")
+            diff_rows.append({'序号': no, '精灵名称': name, '差异类型': '仅主爬取有', '条件': c})
+        for c in sorted(extra_agg):
+            print(f"      仅聚合页有: {c}")
+            diff_rows.append({'序号': no, '精灵名称': name, '差异类型': '仅聚合页有', '条件': c})
+    if diff_rows:
+        save_csv(diff_rows, 'skill_stones_diff.csv', ['序号', '精灵名称', '差异类型', '条件'])
+        print(f"  差异明细已写出 skill_stones_diff.csv（{len(diff_rows)} 行）")
+    else:
+        print("  未发现差异")
+    print("  注：课题归属按全名精确映射序号（分支形态不再被基础名归并），"
+          "故主爬取与聚合页可逐条对齐；若有差异会在此列出。")
 
 
 def main():
@@ -927,6 +1124,10 @@ def main():
         run_check()
     elif mode == 'rebuild':
         run_rebuild()
+    elif mode == 'skillstones':
+        run_skillstones()
+    elif mode == 'validate':
+        validate_skill_stones()
     else:
         print(__doc__)
         return
