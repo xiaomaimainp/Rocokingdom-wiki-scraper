@@ -49,13 +49,13 @@ python nrc_scraper.py validate
 
 | 文件 | 行数 | 说明 | 生成模式 |
 | --- | --- | --- | --- |
-| `spirits_data_all.csv` | 622 | 精灵图鉴完整数据（序号、名称、阶数、进化位置、主副属性、形态、异色、赛季、是否有技能石课题） | 全部 |
-| `spirits_data_all.xlsx` | 622 | 同上，带自动筛选与冻结表头的 Excel 版 | 全部 |
-| `skills_data.csv` | 579 | 技能档案（技能名、属性、类型、威力、耗能、技能描述、风味文本） | 全部 |
-| `skill_sources.csv` | 30772 | 精灵 × 技能 来源（谁会这招、怎么学：自学 / 技能石 / 血脉 / 传说，含获取条件） | 全部 |
-| `combined_data.csv` | 203 | 合并表：精灵 → 最多 3 个技能石 + 获取条件 | 全部 / `rebuild` |
+| `spirits_data_all.csv` | 661 | 精灵图鉴完整数据（序号、名称、阶数、进化位置、主副属性、形态、异色、赛季、是否有技能石课题） | 全部 |
+| `spirits_data_all.xlsx` | 661 | 同上，带自动筛选与冻结表头的 Excel 版 | 全部 |
+| `skills_data.csv` | 607 | 技能档案（技能名、属性、类型、威力、耗能、技能描述、风味文本） | 全部 |
+| `skill_sources.csv` | 32787 | 精灵 × 技能 来源（谁会这招、怎么学：自学 / 技能石 / 血脉 / 传说，含获取条件） | 全部 |
+| `combined_data.csv` | 213 | 合并表：精灵 → 最多 3 个技能石 + 获取条件（与官方聚合页逐条对齐） | 全部 / `rebuild` |
 | `evo_chains.csv` | 进化链：家族 / 分支 / 阶序 / 源精灵(+序号) → 目标精灵(+序号) + 进化条件 + 是否特殊 | 全部 |
-| `skill_stones.csv` | 技能石清单：序号 / 精灵名称 / 类别 / 条件 / 奖励ID（按物种去重，每物种一行） | `skillstones` |
+| `skill_stones.csv` | 技能石清单：序号 / 精灵名称 / 类别 / 条件 / 奖励ID（213 物种 / 502 课题，每物种一行） | `skillstones` |
 | `skill_stones_diff.csv` | 交叉验证差异明细（仅 `validate` 有差异时生成） | `validate` |
 
 ## 合并表格式（combined_data.csv）
@@ -64,11 +64,11 @@ python nrc_scraper.py validate
 
 - 每个精灵最多展示 **3 个**技能石技能。
 - `条件` 列 = 该精灵每个技能石技能的获取条件用 `; ` 拼接，例如 `使用1次闪光; 使用1次光刃`。
-- **一个序号一行**：
-  - 同一精灵的不同形态（如 `鸭吉吉（燃了鸭）`）条件相同，合并成一行，名称取括号前的**基础名**；
-  - 同一序号的进化链成员（如 `迪莫 / 圣光迪莫`）课题相同，也合并成一行，保留**本体形态**（有「精灵阶数」的那个）；
-  - 条件不同的仍各自成行（如 `191` 的 `棋契陛下` 与 `棋祈督`）。
-- 没有技能石课题的精灵不出现在该表，所以 622 个精灵最终只有 203 行。
+- **以官方「图鉴课题」聚合页为准，一个序号（物种）一行**：
+  - 分支形态（如 `191` 的「棋祈督 / 棋契陛下」）**不再拆成重复行**，`精灵名称` 取官方页的物种名；
+  - 技能归属与官方一致（如 `189 棋骑士 = 缠丝劲 / 截拳`），不会错归到其他序号；
+  - `属性` 取自精灵表该序号的主属性。
+- 没有技能石课题的精灵不出现在该表，所以 661 个精灵最终只有 213 行。
 
 示例：
 
@@ -118,11 +118,12 @@ python nrc_scraper.py validate
 
 ### 技能档案（`crawl_skills`）
 - 先从「技能图鉴」页解析 `div.nrc-skill-catalog-card`，取去重后的技能链接（跳过 `redlink=1`）；
-- 再并发抓技能详情页，解析 `.nrc-skill-tags` / `.nrc-skill-type-chip` / `.nrc-skill-category-chip` / `.nrc-skill-effect-text` / `.nrc-skill-flavor` / `.nrc-skill-stat`；
+- 再抓技能详情页解析属性。wiki 在 11-01 后新内容改用 `sd-*` 模板（`data-sd-element` 为属性、`sd-s-stat` 为威力/耗能），旧页面仍为 `.nrc-skill-tags` 等结构，解析器**同时兼容两套模板**；
+- **增量抓取**：仅抓新增技能 + 属性为空的旧技能（约 30 次而非 ~600 次），旧数据由 merge 并集保留，避免全量重抓触发 wiki 限流；属性仍为空（限流）的条目，会在冷却后单独轻量补抓；
 - 这里**只取技能自身属性**，「谁会这招」由精灵页产出（覆盖面更全）。
 
 ### 技能来源与获取条件（`crawl_sources`）
-- 逐个抓精灵详情页的 `div.roco-sk-card`，读 `data-source` 区分为 自学 / 技能石 / 血脉 / 传说；
+- 逐个抓精灵详情页的技能卡：旧模板 `div.roco-sk-card`，新模板 `div.sd-p-skill-card`（以 `data-name` / `data-source` / `data-level` 属性携带全部字段），读 `data-source` 区分为 自学 / 技能石 / 血脉 / 传说；
 - **获取条件的唯一正确来源**是精灵页的「图鉴课题」面板 `div.roco-quest-content > div.roco-quest-row`：
   - 只保留 `使用N次XX` 这类课题，技能名取 `.roco-quest-text` 内嵌的 `a[title]`；
   - ⚠️ 不能用 `.roco-sk-dcard` 的 `.roco-sk-source-task`，那个任务挂在别的精灵身上，会串数据。
@@ -142,7 +143,7 @@ python nrc_scraper.py validate
 - `python nrc_scraper.py skillstones` 抓取 wiki 的「图鉴课题」聚合页，解析全部技能石课题，写出 `skill_stones.csv`（也是 `update` / `rebuild` 构建合并表的数据源）：
   - 数据内嵌在聚合页静态 HTML 的 `book="..."` 属性（HTML 实体转义 JSON），**一次静态请求即可覆盖全部有课题的物种**，无需渲染、无需翻页；
   - 每个物种一行（按序号 + 名称），每一条技能石课题一行；列为 `序号, 精灵名称, 类别, 条件, 奖励ID`；`类别` 固定为 `技能石`，`条件` 即「使用N次XX」，`奖励ID` 为物品 ID（含技能石本体 + 课题研究点）。
-- `python nrc_scraper.py validate` 用 `skill_stones.csv` **交叉验证**主爬取（逐精灵页）的技能石课题：按序号对比两者条件集合，列出「仅主爬取有 / 仅聚合页有」的差异，并写出 `skill_stones_diff.csv`（验证归属映射已修正，目前 202 物种全部一致、0 差异）。
+- `python nrc_scraper.py validate` 用 `skill_stones.csv` **交叉验证**主爬取（逐精灵页）的技能石课题：按序号对比两者条件集合，列出「仅主爬取有 / 仅聚合页有」的差异，并写出 `skill_stones_diff.csv`（验证归属映射已修正，目前 213 物种 / 502 课题全部一致、0 差异）。
 
 ## 配置项（文件顶部）
 
@@ -156,9 +157,10 @@ python nrc_scraper.py validate
 
 ## 注意事项
 
-- 网站结构可能随时间变化。若某模块抓取为空，多半是解析选择器需要同步更新，可对照浏览器实际 DOM 调整。
+- 网站结构可能随时间变化。若某模块抓取为空，多半是解析选择器需要同步更新，可对照浏览器实际 DOM 调整。wiki 在 11-01 后新内容改用 `sd-*` 模板，解析器已兼容。
 - 运行会在当前目录生成日志 `nrc_scraper_<时间>.log`（已被 `.gitignore` 忽略）。
 - Windows 下中文输出已统一为 UTF-8（`sys.stdout.reconfigure`，文件用 `utf-8-sig` 写入）。
+- **数据说明**：S5 部分内容 wiki 尚未更新完全（部分内容有错误），相关数据以 wiki 当前实际页面为准，待 wiki 版本更新后再同步修正。
 
 ## 转载与使用
 

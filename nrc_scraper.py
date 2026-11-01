@@ -313,9 +313,28 @@ def crawl_skill_links():
 
 
 def parse_skill_detail(page, skill_name):
-    """解析技能详情页：属性 / 类型 / 威力 / 耗能 / 描述 / 风味"""
+    """解析技能详情页：属性 / 类型 / 威力 / 耗能 / 描述 / 风味。
+
+    兼容两套模板：
+    - 旧模板：.nrc-skill-tags / .nrc-skill-type-chip / .nrc-skill-stat
+    - 新模板：.sd-s-page（data-sd-element 为属性）/ .sd-s-stat（威力/耗能）
+    """
     detail = {'技能名称': skill_name, '技能属性': '', '技能类型': '', '威力': '',
               '耗能': '', '技能描述': '', '风味文本': ''}
+
+    sd = page.css('.sd-s-page')
+    if sd:
+        el = (sd[0].attrib.get('data-sd-element') or '').strip()
+        detail['技能属性'] = el.replace('系', '').strip()
+        for st in page.css('.sd-s-stat'):
+            label = ''.join(t.strip() for t in st.css('.sd-s-stat-label::text').getall() if t.strip())
+            value = ''.join(t.strip() for t in st.css('.sd-s-stat-value::text').getall() if t.strip())
+            if '威力' in label:
+                detail['威力'] = value
+            elif '耗能' in label:
+                detail['耗能'] = value
+        detail['技能描述'] = text_of(page, '.sd-s-description-text')
+        return detail
 
     tags = page.css('.nrc-skill-tags')
     scope = tags[0] if tags else page
@@ -346,23 +365,49 @@ def parse_skill_detail(page, skill_name):
 
 
 def skill_ok(page):
-    """限流的「简化页」没有属性标签"""
-    return bool(page.css('.nrc-skill-tags'))
+    """限流的「简化页」没有属性标签；新模板用 .sd-s-page 判定"""
+    return bool(page.css('.nrc-skill-tags') or page.css('.sd-s-page'))
 
 
-def crawl_skills():
+def crawl_skills(old_skills=None):
     """技能档案：只取技能自身的属性。
 
     「谁能学这个技能」由精灵页产出（skill_sources.csv），覆盖面更全
     （技能页 30733 对 ⊂ 精灵页 30750 对），所以这里不解析来源。
+
+    增量模式（传入 old_skills）：仅抓取「新增技能」与「属性为空的旧技能」，
+    其余直接复用旧数据，避免全量重抓 ~600 个技能页触发 wiki 限流。
     """
     print(f"\n===== 抓取技能图鉴 =====")
     links = crawl_skill_links()
     if not links:
         return []
-    got = Spider('技能详情').run(links, skill_ok, parse_skill_detail)
-    rows = [{k: d[k] for k in SKILL_FIELDS}
-            for name, _ in links for d in [got.get(name)] if d]
+    url_of = {n: BASE + quote(n) for n, _ in links}
+    link_names = [n for n, _ in links]
+    if old_skills:
+        old_map = {r['技能名称']: r for r in old_skills}
+        need = [n for n in link_names
+                if n not in old_map or not old_map[n].get('技能属性')]
+        base = {n: old_map[n] for n in link_names
+                if n in old_map and old_map[n].get('技能属性')}
+    else:
+        need = link_names
+        base = {}
+    print(f"[增量] 技能需抓取 {len(need)}（新增+属性为空），复用 {len(base)}")
+    got = Spider('技能详情').run([(n, url_of[n]) for n in need], skill_ok, parse_skill_detail)
+    # 限流增量重试：批量并发后，限流页（属性为空）通常已解除，单独轻量补抓
+    missing = [n for n in need if not (got.get(n) or {}).get('技能属性')]
+    if missing:
+        print(f"[技能] {len(missing)} 个属性为空，限流冷却后单独补抓...")
+        time.sleep(SERIAL_GAP)
+        for i, n in enumerate(missing, 1):
+            page = fetch_with_retry(url_of[n], skill_ok, retries=4)
+            if page is not None:
+                got[n] = parse_skill_detail(page, n)
+            if i % 20 == 0 or i == len(missing):
+                print(f"  补抓 {i}/{len(missing)}")
+    rows = list(base.values())
+    rows += [d for n in need for d in [got.get(n)] if d]
     print(f"技能档案共 {len(rows)} 条")
     return rows
 
@@ -404,12 +449,33 @@ def parse_quests(page, pet_name):
 
 
 def parse_pet_skills(page, pet_name):
-    """解析精灵详情页技能表（技能 + 来源），并把图鉴课题的获取条件挂上去"""
+    """解析精灵详情页技能表（技能 + 来源），并把图鉴课题的获取条件挂上去。
+
+    兼容两套模板：
+    - 旧模板：.roco-sk-card（.roco-sk-name / .roco-sk-lv / data-source）
+    - 新模板：.sd-p-skill-card（data-name / data-level / data-source 等属性）
+    """
+    quests = {q['技能名称']: q['获取条件'] for q in parse_quests(page, pet_name)}
+    rows = []
+    # 新模板：技能卡以 data-* 属性携带全部字段
+    for c in page.css('.sd-p-skill-card'):
+        name = (c.attrib.get('data-name') or '').strip()
+        if not name:
+            continue
+        source = (c.attrib.get('data-source') or '').strip()
+        rows.append({
+            '精灵名称': pet_name,
+            '技能名称': name,
+            '来源类型': SOURCE_MAP.get(source, source),
+            '等级': (c.attrib.get('data-level') or '').strip(),
+            '获取条件': quests.get(name, ''),
+        })
+    if rows:
+        return rows
+    # 旧模板
     cards = page.css('.roco-sk-card')
     if not cards:
         return []
-    quests = {q['技能名称']: q['获取条件'] for q in parse_quests(page, pet_name)}
-    rows = []
     for c in cards:
         name = text_of(c, '.roco-sk-name')
         if not name:
@@ -477,7 +543,22 @@ def crawl_sources(names):
     print(f"\n===== 抓取精灵详情页（技能表 + 进化链）=====")
     targets = [(n, BASE + quote(n)) for n in names]
     got = Spider('精灵技能表').run(
-        targets, lambda p: bool(p.css('.roco-sk-card')), parse_pet_full)
+        targets, lambda p: bool(p.css('.roco-sk-card') or p.css('.sd-p-skill-card')), parse_pet_full)
+    # 增量重试：技能与进化链均为空的精灵页，多半是被限流，冷却后单独补抓
+    url_of = {n: u for n, u in targets}
+    missing = [n for n in names
+               if not ((got.get(n) or {}).get('skills') or (got.get(n) or {}).get('evo'))]
+    if missing:
+        print(f"[精灵] {len(missing)} 个技能/进化链为空，限流冷却后单独补抓...")
+        time.sleep(SERIAL_GAP)
+        for i, n in enumerate(missing, 1):
+            page = fetch_with_retry(url_of[n],
+                                    lambda p: bool(p.css('.roco-sk-card') or p.css('.sd-p-skill-card')),
+                                    retries=4)
+            if page is not None:
+                got[n] = parse_pet_full(page, n)
+            if i % 20 == 0 or i == len(missing):
+                print(f"  补抓 {i}/{len(missing)}")
     skills, evo_by = [], {}
     for n in names:
         d = got.get(n)
@@ -547,16 +628,20 @@ def merge_spirits(old, new):
 
 
 def merge_skills(old, new):
-    """技能档案按技能名去重（原有优先，只补新增技能）"""
-    merged, added = list(old), []
-    seen = {r['技能名称'] for r in old}
+    """技能档案按技能名合并：原有优先，但属性为空的旧记录会被新抓到的完整记录升级"""
+    merged, added = {}, []
+    for r in old:
+        merged[r['技能名称']] = r
     for r in new:
-        if r['技能名称'] in seen:
-            continue
-        seen.add(r['技能名称'])
-        merged.append(r)
-        added.append(r)
-    return merged, added
+        name = r['技能名称']
+        if name not in merged:
+            merged[name] = r
+            added.append(r)
+        else:
+            cur = merged[name]
+            if not cur.get('技能属性') and r.get('技能属性'):
+                merged[name] = r
+    return list(merged.values()), added
 
 
 def merge_sources(old, new):
@@ -933,8 +1018,12 @@ def run_update():
     else:
         print("未发现已有数据，本次将全量建立")
 
+    # 技能详情页最先生效：趁 wiki 限流滑动窗口干净，其内置的限流增量重试才能成功；
+    # 否则在精灵/来源高压抓取之后，窗口持续发热，技能属性会大量缺失。
+    print("\n[冷却] 等待 wiki 限流窗口重置...")
+    time.sleep(SERIAL_GAP * 5)
+    new_skills = crawl_skills(old_skills)
     new_spirits = sort_spirits(crawl_spirits())
-    new_skills = crawl_skills()
     if not new_spirits or not new_skills:
         print("本次抓取为空，未改动数据文件")
         return
