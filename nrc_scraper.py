@@ -12,8 +12,11 @@
     python nrc_scraper.py            # 抓取 → 体检 → 合并 → 复检
     python nrc_scraper.py check      # 只体检已有数据文件，不联网
     python nrc_scraper.py rebuild    # 不联网，用已有 CSV 重算合并表
-    python nrc_scraper.py skillstones# 抓取图鉴课题聚合页，生成 skill_stones.csv（技能石）
+    python nrc_scraper.py skillstones # 抓取图鉴课题聚合页，生成 skill_stones.csv（技能石）
     python nrc_scraper.py validate   # 用聚合页交叉验证主爬取的技能石课题
+    python nrc_scraper.py features   # 抓取特性图鉴，生成 features_data.csv 并补精灵表特性两列
+    python nrc_scraper.py normalize  # 不联网，统一来源表的「来源类型」「等级」写法
+    python nrc_scraper.py skillcatalog # 抓全部精灵页，生成 skill_catalog.csv（含血脉属性）
 """
 import csv
 import logging
@@ -42,6 +45,7 @@ from openpyxl.utils import get_column_letter
 BASE = "https://wiki.biligame.com/nrc/"
 SPIRIT_URL = BASE + quote("精灵图鉴")
 SKILL_URL = BASE + quote("技能图鉴")
+FEATURE_URL = BASE + quote("特性图鉴")
 
 MAX_WORKERS = 3           # 并发数（调大会触发 BWiki 限流）
 REQUEST_DELAY = 0.3       # 每个请求前的固定间隔（秒）
@@ -55,18 +59,27 @@ POSITION_MAP = {'initial|': '初始', 'initial|final': '初始|最终', '': ''}
 SOURCE_MAP = {'level': '自学', 'machine': '技能石', 'blood': '血脉', 'legendary': '传说'}
 MAX_SKILLS = 3            # combined_data.csv 每个精灵最多展示几个技能
 
-# 输出三张表 + 一个视图：
-#   spirits_data_all.csv  精灵档案（622）
-#   skills_data.csv       技能档案（579，技能自身的属性，与精灵无关）
+# 输出表：
+#   spirits_data_all.csv  精灵档案
+#   skills_data.csv       技能档案（技能自身的属性，与精灵无关）
 #   skill_sources.csv     精灵 × 技能 来源（谁在哪、怎么获得）
-#   combined_data.csv     精灵 → 最多 3 个技能石 + 获取条件（视图，由前两张算出）
+#   combined_data.csv     精灵 → 最多 3 个技能石 + 获取条件（视图，由聚合页算出）
+#   evo_chains.csv / skill_stones.csv  进化链 / 图鉴课题聚合页
+#   features_data.csv     特性图鉴（每个特性一行，含介绍与拥有精灵）
+SNAP_DIR = '.snapshots'   # 最近两次抓取的键集合，作为「连续两次缺失才淘汰」的基底
+SNAP_KEEP = 2
 SPIRIT_FIELDS = ['序号', '精灵名称', '精灵阶数', '进化位置', '主属性',
-                 '副属性', '形态', '主形态/地区形态', '异色', '赛季', '技能石课题']
+                 '副属性', '形态', '主形态/地区形态', '异色', '赛季', '技能石课题',
+                 '特性', '特性介绍']
 SKILL_FIELDS = ['技能名称', '技能属性', '技能类型', '威力', '耗能',
                 '技能描述', '风味文本']
 SOURCE_FIELDS = ['精灵名称', '技能名称', '来源类型', '等级', '获取条件']
 COMBINED_FIELDS = ['序号', '精灵名称', '属性', '技能名称1', '技能名称2', '技能名称3', '条件']
 EVO_FIELDS = ['家族', '分支', '阶序', '源精灵', '源精灵序号', '目标精灵', '目标精灵序号', '进化条件', '是否特殊']
+FEATURE_FIELDS = ['特性编号', '特性名称', '特性介绍', '主属性', '副属性',
+                  '拥有精灵数', '拥有精灵']
+CATALOG_FIELDS = ['精灵名称', '技能ID', '技能名称', '来源类型', '学习等级',
+                  '血脉属性', '技能系别', '技能类别', '威力', '能耗', '技能描述', '顺序']
 
 F_SPIRITS = 'spirits_data_all.csv'
 F_SPIRITS_XLSX = 'spirits_data_all.xlsx'
@@ -75,7 +88,21 @@ F_SOURCES = 'skill_sources.csv'
 F_COMBINED = 'combined_data.csv'
 F_EVO = 'evo_chains.csv'
 F_STONES = 'skill_stones.csv'
+F_FEATURES = 'features_data.csv'
+F_CATALOG = 'skill_catalog.csv'
 STONE_FIELDS = ['序号', '精灵名称', '类别', '条件', '奖励ID']
+
+# 每张表的记录键：用于快照比对与合并去重（键变了就视为「旧记录消失 + 新记录出现」）
+TABLE_KEYS = {
+    'spirits': lambda r: f"{r.get('序号', '')}|{r.get('精灵名称', '')}",
+    'skills': lambda r: str(r.get('技能名称', '')),
+    'sources': lambda r: f"{r.get('精灵名称', '')}|{r.get('技能名称', '')}",
+    'stones': lambda r: f"{r.get('序号', '')}|{r.get('条件', '')}",
+    'evo': lambda r: '|'.join(str(r.get(k, '')) for k in
+                             ('家族', '分支', '源精灵', '目标精灵', '进化条件')),
+    'features': lambda r: str(r.get('特性编号') or r.get('特性名称', '')),
+    'catalog': lambda r: f"{r.get('精灵名称', '')}|{r.get('技能名称', '')}|{r.get('来源类型', '')}",
+}
 
 
 # ====================== 日志 ======================
@@ -167,6 +194,12 @@ def base_name(name):
     return re.split(r'[（(]', name or '')[0].strip()
 
 
+def is_placeholder(name):
+    """未公开 / 空白占位内容（如 wiki 的「???」），不写入任何数据表"""
+    text = (name or '').strip()
+    return not text or bool(re.fullmatch(r'[\s?？·—_-]+', text))
+
+
 # ====================== 并发抓取器 ======================
 class Spider:
     """通用并发抓取器：ThreadPoolExecutor + 退避重试 + 失败串行补抓"""
@@ -226,7 +259,7 @@ def parse_spirit_list(page, _key=None):
         if not name:
             name = text_of(c, '.npc-card-copy')
         number = (c.attrib.get('data-number', '') or '').strip()
-        if not name or not number:
+        if not name or not number or is_placeholder(name):
             continue
 
         stage_txt = text_of(c, '.npc-stage')
@@ -281,8 +314,11 @@ def crawl_spirits():
     if page is None:
         print("精灵图鉴页抓取失败")
         return []
+    cards = page.css('.npc-card')
     rows = parse_spirit_list(page)
-    print(f"解析到 {len(rows)} 条精灵数据")
+    ignored = len(cards) - len(rows)
+    print(f"解析到 {len(rows)} 条精灵数据" +
+          (f"（忽略 {ignored} 条占位/重复卡片）" if ignored else ""))
     return rows
 
 
@@ -303,7 +339,7 @@ def crawl_skill_links():
         name = (a[0].attrib.get('title', '') or '').strip()
         if not name:
             name = text_of(c, '.nrc-skill-catalog-card-name')
-        if not name or not href or 'redlink=1' in href:
+        if not name or is_placeholder(name) or not href or 'redlink=1' in href:
             continue
         if not href.startswith('http'):
             href = 'https://wiki.biligame.com' + href
@@ -384,8 +420,8 @@ def crawl_skills(old_skills=None):
         return []
     url_of = {n: BASE + quote(n) for n, _ in links}
     link_names = [n for n, _ in links]
+    old_map = {r['技能名称']: r for r in (old_skills or [])}
     if old_skills:
-        old_map = {r['技能名称']: r for r in old_skills}
         need = [n for n in link_names
                 if n not in old_map or not old_map[n].get('技能属性')]
         base = {n: old_map[n] for n in link_names
@@ -407,7 +443,8 @@ def crawl_skills(old_skills=None):
             if i % 20 == 0 or i == len(missing):
                 print(f"  补抓 {i}/{len(missing)}")
     rows = list(base.values())
-    rows += [d for n in need for d in [got.get(n)] if d]
+    # 本次没抓到（限流）的技能沿用旧记录，避免被误判成「wiki 已删除」
+    rows += [d for n in need for d in [got.get(n) or old_map.get(n)] if d]
     print(f"技能档案共 {len(rows)} 条")
     return rows
 
@@ -494,18 +531,37 @@ def parse_pet_skills(page, pet_name):
 def parse_evo_chain(page, pet_name):
     """解析精灵页「进化链」面板，返回该页家族的所有进化步骤。
 
-    .roco-evo-wrap > .roco-evo-timeline（data-branch 标分支）> 节点与连接交替：
-        .roco-evo-node           一个形态（.roco-evo-name-main a[title] 为名，
-                                 .roco-evo-name-sub 为「初阶 · 冰」阶位）
-        .roco-evo-conn > .roco-evo-conn-pill > span   进化条件文本
+    兼容两套模板：
+    - 新模板：.sd-p-evo-group（data-sd-p-evo-branch 标分支）> .sd-p-evo-chain，
+      节点 .sd-p-evo-node 与连接 .sd-p-evo-connector 交替；
+      名字在 .sd-p-evo-name-main a，阶位在 .sd-p-evo-name-sub，
+      条件在 .sd-p-evo-condition。单分支也有 group，隐藏分支仍在 HTML 中。
+    - 旧模板：.roco-evo-wrap > .roco-evo-timeline（data-branch 标分支）>
+      .roco-evo-node / .roco-evo-conn > .roco-evo-conn-pill。
     一个家族的完整链在任意成员页都能拿到，按家族去重由 build_evo_chains 处理。
     """
     steps = []
+    groups = page.css('.sd-p-evo-group') or page.css('.sd-p-evo-chain')
+    for grp in groups:
+        branch = (grp.attrib.get('data-sd-p-evo-branch') or '').strip() or '1'
+        nodes = grp.css('.sd-p-evo-node')
+        conns = grp.css('.sd-p-evo-connector')
+        for i in range(min(len(nodes) - 1, len(conns))):
+            src = _sd_evo_name(nodes[i])
+            tgt = _sd_evo_name(nodes[i + 1])
+            if not src or not tgt:
+                continue
+            steps.append({'分支': branch, '阶序': _sd_evo_sub(nodes[i]),
+                          '源精灵': src, '目标精灵': tgt,
+                          '进化条件': _sd_evo_cond(conns[i])})
+    if steps:
+        return steps
+    # 旧模板
     for tl in page.css('.roco-evo-timeline'):
         branch = (tl.attrib.get('data-branch') or '').strip() or '1'
         nodes = tl.css('.roco-evo-node')
         conns = tl.css('.roco-evo-conn')
-        for i in range(len(nodes) - 1):
+        for i in range(min(len(nodes) - 1, len(conns))):
             src = _evo_name(nodes[i])
             tgt = _evo_name(nodes[i + 1])
             if not src or not tgt:
@@ -514,6 +570,24 @@ def parse_evo_chain(page, pet_name):
             steps.append({'分支': branch, '阶序': _evo_sub(nodes[i]),
                           '源精灵': src, '目标精灵': tgt, '进化条件': cond})
     return steps
+
+
+def _sd_evo_name(node):
+    a = node.css('.sd-p-evo-name-main a')
+    if a:
+        return (a[0].attrib.get('title') or '').strip() or ''.join(
+            t.strip() for t in a[0].css('::text').getall())
+    img = node.css('.sd-p-evo-avatar img')
+    return (img[0].attrib.get('alt') or '').strip() if img else ''
+
+
+def _sd_evo_sub(node):
+    return ''.join(t.strip() for t in node.css('.sd-p-evo-name-sub::text').getall())
+
+
+def _sd_evo_cond(conn):
+    cond = conn.css('.sd-p-evo-condition')
+    return str((cond[0] if cond else conn).get_all_text(strip=True))
 
 
 def _evo_name(node):
@@ -528,17 +602,84 @@ def _evo_sub(node):
     return ''.join(t.strip() for t in node.css('.roco-evo-name-sub::text').getall())
 
 
+# 旧模板把来源文本写进「等级」列（技能石 / 血脉·X / 传说），新模板 data-level 是纯数字。
+# 统一约定：等级列只放数值——自学=真实等级，技能石/传说=999，血脉=15。
+LEVEL_TEXT_MAP = {'技能石': '999', '传说': '999'}
+
+
+def normalize_level(level):
+    """把等级列归一化成纯数字；未知取值原样保留，不硬猜"""
+    s = str(level or '').strip()
+    if not s or s.isdigit():
+        return s
+    m = re.fullmatch(r'LV\s*(\d+)', s, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    if s.startswith('血脉·'):
+        return '15'
+    return LEVEL_TEXT_MAP.get(s, s)
+
+
+def normalize_source_row(row):
+    """统一来源表一行的「来源类型」「等级」写法"""
+    row['来源类型'] = SOURCE_MAP.get(row.get('来源类型', ''), row.get('来源类型', ''))
+    row['等级'] = normalize_level(row.get('等级', ''))
+    return row
+
+
+SKILL_CARD_ID_RE = re.compile(r'^[a-z]+-(.+)-\d+$')
+
+
+def parse_skill_catalog(page, pet_name):
+    """解析精灵详情页技能卡的完整信息，用于生成「精灵技能总表」。
+
+    新模板 .sd-p-skill-card 以 data-* 携带全部字段：
+        data-sd-p-skill = 来源-技能ID-顺序（如 blood-skill_000274-27）
+        data-source / data-type / data-category / data-level / data-power / data-energy
+        .sd-p-skill-description 效果文本
+        .sd-p-learning 学习标签；血脉形如「普通血脉 · Lv.15」，前半段即血脉属性
+    旧模板没有这些字段，本表只收录新模板页面（当前 wiki 已全量换版）。
+    """
+    rows = []
+    for c in page.css('.sd-p-skill-card'):
+        a = c.attrib
+        name = (a.get('data-name') or '').strip()
+        if not name or is_placeholder(name):
+            continue
+        source = SOURCE_MAP.get(a.get('data-source', ''), a.get('data-source', ''))
+        m = SKILL_CARD_ID_RE.match(a.get('data-sd-p-skill') or '')
+        learning = text_of(c, '.sd-p-learning')
+        power = (a.get('data-power') or '').strip()
+        rows.append({
+            '精灵名称': pet_name,
+            '技能ID': m.group(1) if m else '',
+            '技能名称': name,
+            '来源类型': source,
+            '学习等级': normalize_level(a.get('data-level', '')),
+            '血脉属性': learning.split('·')[0].strip() if source == '血脉' else '',
+            '技能系别': (a.get('data-type') or '').strip(),
+            '技能类别': (a.get('data-category') or '').strip(),
+            '威力': '' if power in ('', '-1') else power,
+            '能耗': (a.get('data-energy') or '').strip(),
+            '技能描述': text_of(c, '.sd-p-skill-description'),
+            '顺序': (a.get('data-order') or '').strip(),
+        })
+    return rows
+
+
 def parse_pet_full(page, pet_name):
     """精灵详情页：同时解析技能来源与进化链（复用同一次抓取）"""
-    return {'skills': parse_pet_skills(page, pet_name),
-            'evo': parse_evo_chain(page, pet_name)}
+    skills = [normalize_source_row(r) for r in parse_pet_skills(page, pet_name)
+              if not is_placeholder(r['精灵名称']) and not is_placeholder(r['技能名称'])]
+    return {'skills': skills, 'evo': parse_evo_chain(page, pet_name),
+            'catalog': parse_skill_catalog(page, pet_name)}
 
 
 def crawl_sources(names):
     """精灵 × 技能 来源表 + 进化链（自学/技能石/血脉/传说，含获取条件）。
 
-    复用精灵详情页的同一次抓取，同时取出技能来源与进化链，避免二次请求。
-    返回 (skills_rows, evo_by_spirit)。
+    复用精灵详情页的同一次抓取，同时取出技能来源、进化链与技能总表，避免二次请求。
+    返回 (skills_rows, evo_by_spirit, catalog_rows)。
     """
     print(f"\n===== 抓取精灵详情页（技能表 + 进化链）=====")
     targets = [(n, BASE + quote(n)) for n in names]
@@ -559,14 +700,16 @@ def crawl_sources(names):
                 got[n] = parse_pet_full(page, n)
             if i % 20 == 0 or i == len(missing):
                 print(f"  补抓 {i}/{len(missing)}")
-    skills, evo_by = [], {}
+    skills, evo_by, catalog = [], {}, []
     for n in names:
         d = got.get(n)
         if d:
             skills.extend(d['skills'])
             evo_by[n] = d['evo']
-    print(f"技能来源共 {len(skills)} 条（{len(got)}/{len(names)} 个精灵）；进化链待合并")
-    return skills, evo_by
+            catalog.extend(d.get('catalog', []))
+    print(f"技能来源共 {len(skills)} 条，技能总表 {len(catalog)} 条"
+          f"（{len(got)}/{len(names)} 个精灵）；进化链待合并")
+    return skills, evo_by, catalog
 
 
 # ====================== 读写 ======================
@@ -613,49 +756,90 @@ def save_xlsx(data, path, fields, sheet='精灵图鉴'):
     print(f"已保存 {path}（{len(data)} 条）")
 
 
-# ====================== 合并（保留原有 + 追加新增）======================
-def merge_spirits(old, new):
-    seen = {(r['序号'], r['精灵名称']) for r in old}
-    merged, added = list(old), []
-    for r in new:
-        key = (r['序号'], r['精灵名称'])
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(r)
-        added.append(r)
-    return sort_spirits(merged), added
+# ====================== 合并（最近两次快照 + 覆盖更新 + 缺失淘汰）======================
+def snapshot_files():
+    """按文件名（含时间戳）排序的快照列表"""
+    if not os.path.isdir(SNAP_DIR):
+        return []
+    return sorted(f for f in os.listdir(SNAP_DIR)
+                  if f.startswith('snapshot_') and f.endswith('.json'))
 
 
-def merge_skills(old, new):
-    """技能档案按技能名合并：原有优先，但属性为空的旧记录会被新抓到的完整记录升级"""
-    merged, added = {}, []
-    for r in old:
-        merged[r['技能名称']] = r
-    for r in new:
-        name = r['技能名称']
-        if name not in merged:
-            merged[name] = r
-            added.append(r)
+def load_prev_snapshot():
+    """上一份快照 -> {表名: 键集合}；不存在返回 None（首次运行）"""
+    files = snapshot_files()
+    if not files:
+        return None
+    try:
+        with open(os.path.join(SNAP_DIR, files[-1]), encoding='utf-8') as f:
+            data = json.load(f)
+        return {t: set(keys) for t, keys in data.get('tables', {}).items()}
+    except (OSError, ValueError) as e:
+        print(f"[警告] 快照读取失败，本次按首次运行处理：{e}")
+        return None
+
+
+def save_snapshot(keys_by_table):
+    """保存本次抓取到的键集合，只保留最近 SNAP_KEEP 份"""
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    # 用纳秒时间戳命名：字典序即时间序，且同一秒内多次运行也不会互相覆盖
+    path = os.path.join(SNAP_DIR, f'snapshot_{time.time_ns():020d}.json')
+    payload = {'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+               'tables': {t: sorted(keys) for t, keys in keys_by_table.items()}}
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False)
+    files = snapshot_files()
+    for old in files[:-SNAP_KEEP]:
+        try:
+            os.remove(os.path.join(SNAP_DIR, old))
+        except OSError:
+            pass
+    print(f"快照已保存: {path}（保留最近 {SNAP_KEEP} 份）")
+
+
+def overlay_row(old, new):
+    """本次值非空则覆盖；本次为空时保留旧值，防止限流简化页把已有数据洗成空"""
+    out = dict(old)
+    for k, v in new.items():
+        if str(v or '').strip():
+            out[k] = v
+    return out
+
+
+def merge_table(table, old, new, prev_keys=None):
+    """以本次抓取为准合并一张表。
+
+    - 本次抓到：逐字段用本次值覆盖（空值保留旧值，即字段完整性保护）
+    - 本次没抓到、上一份快照里有：疑似限流，暂留观察
+    - 本次与上一份快照都没有：连续两次缺失，从主表移除
+    - 首次运行（无上一份快照）：只更新 / 追加，不删除任何记录
+
+    返回 (合并后的行, 本次键集合)。
+    """
+    key = TABLE_KEYS[table]
+    old_map = {key(r): r for r in old}
+    new_map = {key(r): r for r in new}
+    prev = old_map.keys() if prev_keys is None else prev_keys
+    merged, added, updated, pending, dropped = {}, [], 0, 0, []
+    for k, row in old_map.items():
+        if k in new_map:
+            merged[k] = overlay_row(row, new_map[k])
+            if merged[k] != row:
+                updated += 1
+        elif k in prev:
+            merged[k] = row
+            pending += 1
         else:
-            cur = merged[name]
-            if not cur.get('技能属性') and r.get('技能属性'):
-                merged[name] = r
-    return list(merged.values()), added
-
-
-def merge_sources(old, new):
-    """来源表按 (精灵, 技能) 去重；新数据带条件时覆盖旧的空条件"""
-    idx = {(r['精灵名称'], r['技能名称']): r for r in old}
-    added = []
-    for r in new:
-        key = (r['精灵名称'], r['技能名称'])
-        if key not in idx:
-            idx[key] = r
-            added.append(r)
-        elif r.get('获取条件') and not idx[key].get('获取条件'):
-            idx[key] = r
-    return list(idx.values()), added
+            dropped.append(k)
+    for k, row in new_map.items():
+        if k not in merged:
+            merged[k] = row
+            added.append(row)
+    print(f"[{table}] 更新 {updated} / 新增 {len(added)} / 本次缺失待观察 {pending} / "
+          f"连续两次缺失淘汰 {len(dropped)}")
+    if dropped:
+        print(f"    淘汰示例: {dropped[:5]}")
+    return list(merged.values()), set(new_map)
 
 
 def sort_spirits(rows):
@@ -847,6 +1031,89 @@ def sort_evo(rows):
     return sorted(rows, key=key)
 
 
+# ====================== 特性图鉴 ======================
+def parse_feature_catalog(page):
+    """解析特性图鉴页，返回 (特性表行, 精灵名 -> (特性名, 特性介绍)) 映射。
+
+    .nrc-feature-catalog-card 上有：
+        .nrc-skill-catalog-card-name     特性名
+        .nrc-feature-card-description   特性介绍
+        .nrc-feature-card-owner-avatar  拥有该特性的精灵头像（每个一）
+        data-feature-primary-type / secondary-type  特性分类
+        data-skill-catalog-text = 「特性名 介绍 特性编号 拥有者… 属性…」
+    拥有者名字从 text 尾部解析：按介绍切分后去掉 6 位编号与末尾属性词；
+    解析出的个数必须与头像数一致，否则不猜、置空以免错配。
+    """
+    rows, owners_map = [], {}
+    for c in page.css('.nrc-feature-catalog-card'):
+        name = text_of(c, '.nrc-skill-catalog-card-name')
+        desc = text_of(c, '.nrc-feature-card-description')
+        if not name or is_placeholder(name):
+            continue
+        avatars = c.css('.nrc-feature-card-owner-avatar')
+        text = c.attrib.get('data-skill-catalog-text') or ''
+        tail = text.split(desc, 1)[1].strip() if desc and desc in text else ''
+        m = re.match(r'^(\d{6})\s+(.*)$', tail)
+        number = m.group(1) if m else (c.attrib.get('data-skill-catalog-id') or '')
+        tokens = m.group(2).split() if m else []
+        attrs = set()
+        for k in ('data-feature-primary-type', 'data-feature-secondary-type',
+                  'data-skill-catalog-type'):
+            for a in (c.attrib.get(k) or '').split('|'):
+                if a.strip():
+                    attrs.add(a.strip())
+        while tokens and tokens[-1] in attrs:
+            tokens.pop()
+        owners = [t for t in tokens if not is_placeholder(t)]
+        if len(owners) != len(avatars):
+            owners = []
+        rows.append({
+            '特性编号': str(number),
+            '特性名称': name,
+            '特性介绍': desc,
+            '主属性': (c.attrib.get('data-feature-primary-type') or '').strip(),
+            '副属性': (c.attrib.get('data-feature-secondary-type') or '').strip(),
+            '拥有精灵数': str(len(avatars)),
+            '拥有精灵': '; '.join(owners),
+        })
+        for o in owners:
+            owners_map[o] = (name, desc)
+    return rows, owners_map
+
+
+def owners_map_from_features(features):
+    """从特性表的「拥有精灵」列还原 精灵名 -> (特性名, 特性介绍) 映射"""
+    m = {}
+    for r in features or []:
+        for name in (r.get('拥有精灵') or '').split(';'):
+            name = name.strip()
+            if name:
+                m[name] = (r.get('特性名称', ''), r.get('特性介绍', ''))
+    return m
+
+
+def mark_traits(spirits, owners_map):
+    """给精灵档案补「特性」「特性介绍」两列：先全名精确，再基础名（去形态后缀）兜底"""
+    for r in spirits:
+        name = r.get('精灵名称', '')
+        hit = owners_map.get(name) or owners_map.get(base_name(name))
+        r['特性'] = hit[0] if hit else ''
+        r['特性介绍'] = hit[1] if hit else ''
+    return spirits
+
+
+def crawl_features():
+    """抓取特性图鉴页（一次静态请求即可覆盖全部特性与拥有精灵）"""
+    print("\n===== 抓取特性图鉴 =====")
+    page = fetch_with_retry(FEATURE_URL, lambda p: bool(p.css('.nrc-feature-catalog-card')))
+    if page is None:
+        print("特性图鉴页抓取失败")
+        return [], {}
+    rows, owners_map = parse_feature_catalog(page)
+    print(f"解析到 {len(rows)} 个特性，覆盖 {len(owners_map)} 个精灵名")
+    return rows, owners_map
+
+
 # ====================== 体检 ======================
 def mark_quest(spirits, sources, stones=None):
     """给精灵档案补「技能石课题」列（有/无）。有聚合页数据时按序号（物种）判定，否则回退基础名。"""
@@ -864,7 +1131,8 @@ def mark_quest(spirits, sources, stones=None):
     return spirits
 
 
-def check_data(spirits, skills, sources, combined, evo, stones=None, label=''):
+def check_data(spirits, skills, sources, combined, evo, stones=None, label='',
+               features=None, catalog=None):
     """检查数据完整性，返回 (统计 dict, 问题 list)"""
     stats, issues = {}, []
 
@@ -951,6 +1219,27 @@ def check_data(spirits, skills, sources, combined, evo, stones=None, label=''):
             issues.append(f'进化链：{len(missing)} 个名称在精灵表（按序号）找不到，'
                           f'如 {[m[0] for m in missing[:8]]}')
 
+    # ---- 特性 ----
+    if features:
+        stats['特性数'] = len(features)
+        stats['特性覆盖精灵名'] = len(owners_map_from_features(features))
+        stats['有特性的精灵'] = sum(1 for r in spirits if r.get('特性'))
+        no_trait = [r['精灵名称'] for r in spirits if not r.get('特性')]
+        if no_trait:
+            issues.append(f'特性：{len(no_trait)} 个精灵没匹配到特性，如 {no_trait[:5]}')
+
+    # ---- 技能总表 ----
+    if catalog:
+        stats['技能总表行数'] = len(catalog)
+        stats['技能总表精灵'] = len({r.get('精灵名称', '') for r in catalog})
+        stats['带血脉属性'] = sum(1 for r in catalog if r.get('血脉属性'))
+        # wiki 已下架的精灵（页面 404）本来就没有技能卡，只在成片缺失时报警
+        no_cat = {r['精灵名称'] for r in spirits} - {r.get('精灵名称', '') for r in catalog}
+        stats['技能总表缺失精灵'] = len(no_cat)
+        if len(no_cat) > 5:
+            issues.append(f'技能总表：{len(no_cat)} 个精灵没有技能卡记录（疑似限流），'
+                          f'如 {sorted(no_cat)[:5]}')
+
     # ---- 输出 ----
     print(f"\n===== 体检{'：' + label if label else ''} =====")
     for k, v in stats.items():
@@ -970,46 +1259,64 @@ def diff_report(old_spirits, new_spirits, old_skills, new_skills):
     os_n = {(r['序号'], r['精灵名称']) for r in old_spirits}
     ns_n = {(r['序号'], r['精灵名称']) for r in new_spirits}
     added, gone = ns_n - os_n, os_n - ns_n
-    print(f"  精灵：上次 {len(os_n)} → 本次 {len(ns_n)}；新增 {len(added)}，消失 {len(gone)}")
+    print(f"  精灵：上次 {len(os_n)} → 本次 {len(ns_n)}；新增 {len(added)}，本次缺失 {len(gone)}")
     for r in sorted(added)[:20]:
         print(f"    + {r[0]} {r[1]}")
     if gone:
-        print(f"    [注意] 本次未抓到：{sorted(gone)[:20]}")
+        print(f"    [本次缺失] {sorted(gone)[:20]}（连续两次缺失才淘汰）")
 
     os_k = {r['技能名称'] for r in old_skills}
     ns_k = {r['技能名称'] for r in new_skills}
-    print(f"  技能：上次 {len(os_k)} → 本次 {len(ns_k)}；新增 {len(ns_k - os_k)}，消失 {len(os_k - ns_k)}")
+    print(f"  技能：上次 {len(os_k)} → 本次 {len(ns_k)}；新增 {len(ns_k - os_k)}，本次缺失 {len(os_k - ns_k)}")
     for n in sorted(ns_k - os_k)[:20]:
         print(f"    + {n}")
     if os_k - ns_k:
-        print(f"    [注意] 本次未抓到：{sorted(os_k - ns_k)[:20]}")
-    print(f"  技能来源记录：上次 {len(old_skills)} → 本次 {len(new_skills)}"
-          f"（+{len(new_skills) - len(old_skills)}）")
+        print(f"    [本次缺失] {sorted(os_k - ns_k)[:20]}（连续两次缺失才淘汰）")
+    print("  说明：本次缺失的条目会与上一份快照比对，连续两次都读不到才从表中移除")
 
 
 # ====================== 主流程 ======================
-def write_all(spirits, skills, sources, combined, evo, stones, label):
+def write_all(spirits, skills, sources, combined, evo, stones, label,
+              features=None, catalog=None):
     save_csv(spirits, F_SPIRITS, SPIRIT_FIELDS)
     save_xlsx(spirits, F_SPIRITS_XLSX, SPIRIT_FIELDS)
     save_csv(skills, F_SKILLS, SKILL_FIELDS)
     save_csv(sources, F_SOURCES, SOURCE_FIELDS)
     save_csv(combined, F_COMBINED, COMBINED_FIELDS)
-    if stones:
+    if stones is not None:
         save_csv(stones, F_STONES, STONE_FIELDS)
     save_csv(evo, F_EVO, EVO_FIELDS)
-    check_data(spirits, skills, sources, combined, evo, stones, label)
+    if features is not None:
+        save_csv(features, F_FEATURES, FEATURE_FIELDS)
+    if catalog is not None:
+        save_csv(catalog, F_CATALOG, CATALOG_FIELDS)
+    check_data(spirits, skills, sources, combined, evo, stones, label, features, catalog)
 
 
 def run_update():
-    """抓取 → 体检 → 合并 → 复检（已有数据则先体检并报告差异）"""
+    """抓取 → 体检 → 合并 → 复检（以本次抓取为准，连续两次缺失才淘汰）"""
     print("=" * 60)
     print("运行：体检 → 抓取 → 合并 → 复检")
     print("=" * 60)
-    old_spirits = read_csv(F_SPIRITS, SPIRIT_FIELDS)
-    old_skills = read_csv(F_SKILLS, SKILL_FIELDS)
-    old_sources = read_csv(F_SOURCES, SOURCE_FIELDS)
+    prev = load_prev_snapshot()
+    if prev is None:
+        print("[快照] 未发现上一份基底，本次只更新 / 追加，不淘汰任何记录")
+    else:
+        print(f"[快照] 上一份基底：{', '.join(f'{t}={len(k)}' for t, k in prev.items())} "
+              f"（连续两次缺失才淘汰）")
+
+    # 历史数据里若残留「???」等占位条目，先清掉
+    old_spirits = [r for r in read_csv(F_SPIRITS, SPIRIT_FIELDS)
+                   if not is_placeholder(r['精灵名称'])]
+    old_skills = [r for r in read_csv(F_SKILLS, SKILL_FIELDS)
+                  if not is_placeholder(r['技能名称'])]
+    old_sources = [r for r in read_csv(F_SOURCES, SOURCE_FIELDS)
+                   if not is_placeholder(r['精灵名称']) and not is_placeholder(r['技能名称'])]
     old_combined = read_csv(F_COMBINED, COMBINED_FIELDS)
     old_evo = read_csv(F_EVO, EVO_FIELDS)
+    old_stones = read_csv(F_STONES, STONE_FIELDS)
+    old_features = read_csv(F_FEATURES, FEATURE_FIELDS)
+    old_catalog = read_csv(F_CATALOG, CATALOG_FIELDS)
 
     if old_spirits and old_skills:
         print(f"已有数据：精灵 {len(old_spirits)} / 技能 {len(old_skills)} / "
@@ -1027,26 +1334,49 @@ def run_update():
     if not new_spirits or not new_skills:
         print("本次抓取为空，未改动数据文件")
         return
-    new_sources, new_evo_by = crawl_sources([r['精灵名称'] for r in new_spirits])
+    new_sources, new_evo_by, new_catalog = crawl_sources([r['精灵名称'] for r in new_spirits])
+    new_features, _ = crawl_features()
 
     if old_spirits:
         diff_report(old_spirits, new_spirits, old_skills, new_skills)
 
-    spirits, add_s = merge_spirits(old_spirits, new_spirits)
-    skills, add_k = merge_skills(old_skills, new_skills)
-    sources, add_r = merge_sources(old_sources, new_sources)
-    print(f"\n合并结果：精灵 +{len(add_s)} → {len(spirits)}；"
-          f"技能 +{len(add_k)} → {len(skills)}；来源 +{len(add_r)} → {len(sources)}")
+    pk = prev or {}
+    print("\n===== 合并（覆盖更新 + 两次缺失淘汰）=====")
+    spirits, k_spirits = merge_table('spirits', old_spirits, new_spirits, pk.get('spirits'))
+    skills, k_skills = merge_table('skills', old_skills, new_skills, pk.get('skills'))
+    sources, k_sources = merge_table('sources', old_sources, new_sources, pk.get('sources'))
+    spirits = sort_spirits(spirits)
+    print(f"合并结果：精灵 {len(spirits)} / 技能 {len(skills)} / 来源 {len(sources)}")
 
-    # 以官方「图鉴课题」聚合页为准构建合并表（一次性静态抓取，覆盖全量）
+    # 技能石：一次静态请求覆盖全量；失败时按空结果处理，由 merge_table 暂留旧记录
     try:
-        stones = crawl_skill_stones()
+        new_stones = crawl_skill_stones()
     except Exception as e:
-        print(f"[警告] 聚合页抓取失败，合并表回退到来源表：{e}")
-        stones = None
+        print(f"[警告] 聚合页抓取失败，本次按空结果处理：{e}")
+        new_stones = []
+    stones, k_stones = merge_table('stones', old_stones, new_stones, pk.get('stones'))
+    stones.sort(key=lambda r: (int(r['序号']) if str(r['序号']).isdigit() else 10 ** 9,
+                               r.get('精灵名称', '')))
     mark_quest(spirits, sources, stones)
-    evo = sort_evo(enrich_evo_no(build_evo_chains(new_evo_by), spirits))
-    write_all(spirits, skills, sources, build_combined(spirits, sources, stones), evo, stones, '合并后复检')
+    features, k_features = merge_table('features', old_features, new_features, pk.get('features'))
+    mark_traits(spirits, owners_map_from_features(features))
+    catalog, k_catalog = merge_table('catalog', old_catalog, new_catalog, pk.get('catalog'))
+
+    # 进化链：按本次精灵页重建；整轮为空时保留旧数据，且不推进淘汰计数
+    new_evo = sort_evo(enrich_evo_no(build_evo_chains(new_evo_by), spirits))
+    if not new_evo and old_evo:
+        print(f"[警告] 本次未解析到任何进化链，保留上次 {len(old_evo)} 行并跳过淘汰判定")
+        evo = old_evo
+        k_evo = {TABLE_KEYS['evo'](r) for r in old_evo}
+    else:
+        evo, k_evo = merge_table('evo', old_evo, new_evo, pk.get('evo'))
+        evo = sort_evo(evo)
+
+    write_all(spirits, skills, sources, build_combined(spirits, sources, stones),
+              evo, stones, '合并后复检', features, catalog)
+    save_snapshot({'spirits': k_spirits, 'skills': k_skills, 'sources': k_sources,
+                   'stones': k_stones, 'evo': k_evo, 'features': k_features,
+                   'catalog': k_catalog})
     print("\n更新完成")
 
 
@@ -1060,7 +1390,9 @@ def run_check():
         print("没有可体检的数据文件")
         return
     stones = read_csv(F_STONES, STONE_FIELDS) if os.path.exists(F_STONES) else None
-    check_data(spirits, skills, sources, combined, evo, stones, '当前数据')
+    features = read_csv(F_FEATURES, FEATURE_FIELDS) if os.path.exists(F_FEATURES) else None
+    catalog = read_csv(F_CATALOG, CATALOG_FIELDS) if os.path.exists(F_CATALOG) else None
+    check_data(spirits, skills, sources, combined, evo, stones, '当前数据', features, catalog)
 
 
 def run_rebuild():
@@ -1074,7 +1406,97 @@ def run_rebuild():
         return
     stones = read_csv(F_STONES, STONE_FIELDS) if os.path.exists(F_STONES) else None
     mark_quest(spirits, sources, stones)
-    write_all(spirits, skills, sources, build_combined(spirits, sources, stones), evo, stones, '重建后复检')
+    features = read_csv(F_FEATURES, FEATURE_FIELDS)
+    if features:
+        mark_traits(spirits, owners_map_from_features(features))
+    write_all(spirits, skills, sources, build_combined(spirits, sources, stones), evo, stones,
+              '重建后复检', features or None)
+
+
+def run_features():
+    """只抓特性图鉴：写出特性表，并给精灵档案补「特性」「特性介绍」两列。
+
+    只发一次静态请求，不重抓 662 个精灵页；不写快照，避免影响其它表的淘汰判定。
+    """
+    features, owners_map = crawl_features()
+    if not features:
+        print("未解析到特性，未改动数据文件")
+        return
+    save_csv(features, F_FEATURES, FEATURE_FIELDS)
+    spirits = [r for r in read_csv(F_SPIRITS, SPIRIT_FIELDS)
+               if not is_placeholder(r.get('精灵名称', ''))]
+    if not spirits:
+        print("未找到精灵图鉴数据，已单独写出特性表")
+        return
+    mark_traits(sort_spirits(spirits), owners_map)
+    save_csv(spirits, F_SPIRITS, SPIRIT_FIELDS)
+    save_xlsx(spirits, F_SPIRITS_XLSX, SPIRIT_FIELDS)
+    covered = sum(1 for r in spirits if r.get('特性'))
+    print(f"特性表 {len(features)} 行已保存；精灵表 {len(spirits)} 行，"
+          f"其中 {covered} 行已填特性 / 特性介绍")
+    check_data(spirits, read_csv(F_SKILLS, SKILL_FIELDS),
+               read_csv(F_SOURCES, SOURCE_FIELDS),
+               read_csv(F_COMBINED, COMBINED_FIELDS),
+               read_csv(F_EVO, EVO_FIELDS),
+               read_csv(F_STONES, STONE_FIELDS), '特性更新后复检', features)
+
+
+def run_normalize():
+    """离线统一 skill_sources.csv 的「来源类型」「等级」写法（不联网、不动其它表）"""
+    rows = read_csv(F_SOURCES, SOURCE_FIELDS)
+    if not rows:
+        print("没有来源表数据")
+        return
+    changed = 0
+    for r in rows:
+        before = (r.get('来源类型', ''), r.get('等级', ''))
+        normalize_source_row(r)
+        if (r.get('来源类型', ''), r.get('等级', '')) != before:
+            changed += 1
+    save_csv(rows, F_SOURCES, SOURCE_FIELDS)
+    types = sorted({r['来源类型'] for r in rows})
+    levels = sorted({r['等级'] for r in rows if r['等级']})
+    print(f"来源表 {len(rows)} 行，已统一 {changed} 行；"
+          f"来源类型 {types}；等级取值 {len(levels)} 种：{levels[:12]}")
+
+
+def run_skillcatalog():
+    """抓取全部精灵页，生成 / 刷新「精灵技能总表」（不动其它表、不写快照）。
+
+    以精灵为单位整体替换：本次抓到技能卡的精灵用最新列表（版本改动后旧技能自然消失），
+    抓取失败的精灵沿用旧记录，避免限流把整只精灵的技能清空。
+    """
+    names = [r['精灵名称'] for r in read_csv(F_SPIRITS, SPIRIT_FIELDS)
+             if not is_placeholder(r.get('精灵名称', ''))]
+    if not names:
+        print("未找到精灵图鉴数据，请先运行 nrc_scraper.py")
+        return
+    _, _, catalog = crawl_sources(names)
+    if not catalog:
+        print("未解析到技能卡，未改动数据文件")
+        return
+    old = read_csv(F_CATALOG, CATALOG_FIELDS)
+    new_by, old_by = defaultdict(list), defaultdict(list)
+    for r in catalog:
+        new_by[r['精灵名称']].append(r)
+    for r in old:
+        old_by[r['精灵名称']].append(r)
+    merged, kept = [], []
+    for name in sorted(set(old_by) | set(new_by)):
+        if new_by.get(name):
+            merged.extend(new_by[name])
+        else:
+            merged.extend(old_by.get(name, []))
+            if old_by.get(name):
+                kept.append(name)
+    save_csv(merged, F_CATALOG, CATALOG_FIELDS)
+    blood = sum(1 for r in merged if r.get('血脉属性'))
+    print(f"技能总表 {len(merged)} 行 / {len({r['精灵名称'] for r in merged})} 个精灵，"
+          f"其中 {blood} 行带血脉属性；本次抓取缺失、沿用旧数据的精灵 {len(kept)} 个")
+    check_data(read_csv(F_SPIRITS, SPIRIT_FIELDS), read_csv(F_SKILLS, SKILL_FIELDS),
+               read_csv(F_SOURCES, SOURCE_FIELDS), read_csv(F_COMBINED, COMBINED_FIELDS),
+               read_csv(F_EVO, EVO_FIELDS), read_csv(F_STONES, STONE_FIELDS),
+               '技能总表复检', read_csv(F_FEATURES, FEATURE_FIELDS) or None, merged)
 
 
 # ====================== 图鉴课题（技能石）聚合页 ======================
@@ -1095,6 +1517,8 @@ def extract_skill_stones(html):
             continue
         no = str(o.get('number', '')).strip()
         name = (o.get('name') or '').strip()
+        if is_placeholder(name):
+            continue
         for t in o.get('topics', []):
             if t.get('category') != 'skill':
                 continue
@@ -1217,6 +1641,12 @@ def main():
         run_skillstones()
     elif mode == 'validate':
         validate_skill_stones()
+    elif mode == 'features':
+        run_features()
+    elif mode == 'normalize':
+        run_normalize()
+    elif mode == 'skillcatalog':
+        run_skillcatalog()
     else:
         print(__doc__)
         return

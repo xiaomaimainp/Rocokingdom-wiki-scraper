@@ -9,5 +9,8 @@ __pycache__/
 # 旧数据备份
 backup/
 
+# 最近两次抓取的快照基底
+.snapshots/
+
 # Editor
 .vscode/
